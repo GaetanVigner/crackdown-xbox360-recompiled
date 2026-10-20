@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <thread>
 
 #if defined(_WIN32)
@@ -29,6 +30,10 @@
 #include "hang_watchdog.h"
 #include "physics_telemetry.h"
 #include "settings.h"
+
+REXCVAR_DEFINE_INT32(crackdown_debug_frame_dips, 0, "Crackdown",
+                     "Developer test of uneven frame rates: 0 off, else the maximum extra delay in ms (up to 100) added "
+                     "before frames, sweeping from none to full every 6 s with random jitter and rare stalls of twice it");
 
 REX_EXTERN(__imp__sub_826A7698);
 REX_EXTERN(__imp__sub_826A6B50);
@@ -160,9 +165,34 @@ void SelectVariableStep(uint8_t* base, int rate) {
   }
 }
 
+// crackdown_debug_frame_dips: delays the frame's start, so the pacing below measures it as a late frame exactly like
+// one the GPU could not finish in time.
+void DebugFrameDip() {
+  const int max_ms = REXCVAR_GET(crackdown_debug_frame_dips);
+  static int logged_ms = 0;
+  if (max_ms != logged_ms) {
+    logged_ms = max_ms;
+    if (max_ms > 0) {
+      REXLOG_WARN("Debug frame dips: up to {} ms extra per frame", std::min(max_ms, crackdown::kMaxDebugDipMs));
+    }
+  }
+  if (max_ms <= 0) {
+    return;
+  }
+  static std::mt19937 random{std::random_device{}()};
+  static const int64_t start_ns = NowNs();
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  const int64_t now = NowNs();
+  const double delay = crackdown::DebugFrameDipSeconds(max_ms, double(now - start_ns) * 1e-9, unit(random), unit(random));
+  if (delay > 0.0) {
+    WaitUntil(now + int64_t(delay * 1e9));
+  }
+}
+
 // Picks this frame's step; host-paced rates first wait for their release time, 30 and 60 measure the real
 // interval since they are already paced by the guest vblank.
 void BeginFrame(int rate) {
+  DebugFrameDip();
   const int64_t now = NowNs();
   if (crackdown::HostPacedFrameRate(rate)) {
     const crackdown::FramePacer::Frame frame = g_pacer.Next(rate, now);

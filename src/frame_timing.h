@@ -169,6 +169,26 @@ class StepSmoother {
   double owed_ = 0.0;
 };
 
+// Developer test of uneven frame times (crackdown_debug_frame_dips): the extra delay before a frame, as if the GPU
+// could not keep up. The load sweeps from none to full and back every kDipPeriodSeconds, each frame takes 60-100% of
+// the current load (jitter in [0, 1)), and kDipSpikeChance of frames (spike below it) stall for twice the maximum.
+inline constexpr double kDipPeriodSeconds = 6.0;
+inline constexpr double kDipSpikeChance = 0.01;
+inline constexpr int kMaxDebugDipMs = 100;
+
+inline double DebugFrameDipSeconds(int max_ms, double seconds, double jitter, double spike) {
+  if (max_ms <= 0) {
+    return 0.0;
+  }
+  const double max = std::min(max_ms, kMaxDebugDipMs) * 1e-3;
+  if (spike < kDipSpikeChance) {
+    return 2.0 * max;
+  }
+  constexpr double kTwoPi = 6.283185307179586;
+  const double load = 0.5 - 0.5 * std::cos(kTwoPi * seconds / kDipPeriodSeconds);
+  return max * load * (0.6 + 0.4 * jitter);
+}
+
 // A frame's whole milliseconds for the title's integer frame-time sites, carrying the fraction like TakeWhole but
 // never 0: the camera divides by its time step, so a frame shorter than a millisecond takes one and the next frames
 // pay it back, keeping the total exact.
@@ -185,7 +205,7 @@ constexpr uint32_t TakeFrameMs(double& total_ms) {
 // Host pacing for HostPacedFrameRate rates. A fixed rate releases frames on a grid of its period, so sleep overshoot
 // never accumulates, and an on-time frame steps exactly one period. A frame that starts after its slot restarts the
 // grid at once (no backlog of slots behind it), and its step comes from StepSmoother. Unlimited never waits and steps
-// the measured time.
+// the measured time through StepSmoother too, since its intervals vary from frame to frame.
 class FramePacer {
  public:
   struct Frame {
@@ -205,7 +225,7 @@ class FramePacer {
     if (rate == kFrameRateUnlimited) {
       const int64_t elapsed = now_ns - last_ns_;
       last_ns_ = now_ns;
-      return {now_ns, MeasuredFrameStep(double(elapsed) * 1e-9)};
+      return {now_ns, StepFromSeconds(smoother_.Take(double(elapsed) * 1e-9))};
     }
     if (++index_ == rate) {
       // A whole second of periods is exactly 1e9 ns, so the grid moves on without rounding.

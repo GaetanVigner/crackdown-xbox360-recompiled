@@ -177,18 +177,42 @@ void TestStepSmoother() {
   CHECK(smoother.owed() <= kMaxMeasuredFrameSeconds);
 }
 
+void TestDebugFrameDips() {
+  // Off: never a delay.
+  CHECK(DebugFrameDipSeconds(0, 3.0, 0.5, 0.5) == 0.0);
+  // No load at the start of the sweep, full load half way, within 60-100% of it.
+  CHECK(DebugFrameDipSeconds(20, 0.0, 0.9, 0.5) == 0.0);
+  const double full = DebugFrameDipSeconds(20, kDipPeriodSeconds / 2, 0.0, 0.5);
+  CHECK(std::fabs(full - 0.012) < 1e-9);
+  CHECK(std::fabs(DebugFrameDipSeconds(20, kDipPeriodSeconds / 2, 0.999999, 0.5) - 0.02) < 1e-6);
+  // A spike stalls for twice the maximum; the maximum itself is capped.
+  CHECK(std::fabs(DebugFrameDipSeconds(20, 1.0, 0.5, 0.0) - 0.04) < 1e-12);
+  CHECK(std::fabs(DebugFrameDipSeconds(1000, 1.0, 0.5, 0.0) - 2.0 * kMaxDebugDipMs * 1e-3) < 1e-12);
+}
+
 void TestPacerUnlimited() {
   FramePacer pacer;
   FramePacer::Frame frame = pacer.Next(kFrameRateUnlimited, kSecond);
   CHECK(frame.release_ns == kSecond);
   CHECK(frame.step.seconds > 0.0);
-  frame = pacer.Next(kFrameRateUnlimited, kSecond + 4'000'000);
-  CHECK(frame.release_ns == kSecond + 4'000'000);
-  CHECK(std::fabs(frame.step.seconds - 0.004) < 1e-12);
-  frame = pacer.Next(kFrameRateUnlimited, kSecond + 4'000'000);
-  CHECK(frame.step.seconds == kMinMeasuredFrameSeconds);
+  // Steady 4 ms frames: the smoothed step settles on 4 ms, and game time matches real time.
+  int64_t now = kSecond;
+  double game = 0.0;
+  for (int i = 0; i < 200; ++i) {
+    now += 4'000'000;
+    frame = pacer.Next(kFrameRateUnlimited, now);
+    CHECK(frame.release_ns == now);
+    game += frame.step.seconds;
+  }
+  CHECK(std::fabs(frame.step.seconds - 0.004) < 1e-6);
+  CHECK(std::fabs(game - 0.8) < 0.02);
+  // One 20 ms frame does not become a 20 ms step at once; the time is paid back over the next frames.
+  now += 20'000'000;
+  frame = pacer.Next(kFrameRateUnlimited, now);
+  CHECK(frame.step.seconds > 0.004 && frame.step.seconds < 0.012);
+  // A stall never steps more than the title's own 1/30 s.
   frame = pacer.Next(kFrameRateUnlimited, 3 * kSecond);
-  CHECK(frame.step.seconds == kMaxMeasuredFrameSeconds);
+  CHECK(frame.step.seconds <= kMaxMeasuredFrameSeconds);
   // Switching to a fixed rate starts a new grid.
   frame = pacer.Next(144, 4 * kSecond);
   CHECK(frame.release_ns == 4 * kSecond && frame.step.seconds == 1.0 / 144);
@@ -239,6 +263,7 @@ int main() {
   TestPacerCannotKeepUp();
   TestStepSmoother();
   TestPacerUnlimited();
+  TestDebugFrameDips();
   TestFrameMs();
   return check::Finish("frame_timing_tests");
 }
