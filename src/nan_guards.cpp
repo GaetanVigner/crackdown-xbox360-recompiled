@@ -17,6 +17,7 @@
 
 #include "guest_memory.h"
 #include "nan_guard_rules.h"
+#include "physics_telemetry.h"
 
 namespace {
 
@@ -26,6 +27,7 @@ using crackdown::guest::StoreFloat;
 constexpr uint32_t kLookTargetOffset = 0x13B0;
 constexpr uint32_t kPositionOffset = 0x140;
 constexpr int64_t kLogGapMs = 2000;
+constexpr int64_t kDumpGapMs = 20000;
 
 uint8_t* GuestBase() {
   return rex::system::kernel_state()->memory()->virtual_membase();
@@ -49,6 +51,7 @@ struct RepairLog {
   const char* what;
   std::atomic<int64_t> last_ms{0};
   std::atomic<uint32_t> pending{0};
+  std::atomic<int64_t> last_dump_ms{-kDumpGapMs};
 
   void Note() {
     const uint32_t count = pending.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -57,6 +60,12 @@ struct RepairLog {
     if (now - last >= kLogGapMs && last_ms.compare_exchange_strong(last, now)) {
       pending.store(0, std::memory_order_relaxed);
       REXLOG_WARN("[NAN_GUARD] {} was not finite ({} repair(s) since the last line)", what, count);
+    }
+    // With crackdown_physics_telemetry on, a repair keeps the seconds before it, which hold whatever produced the
+    // NaN; one dump per kDumpGapMs per kind.
+    int64_t dumped = last_dump_ms.load(std::memory_order_relaxed);
+    if (now - dumped >= kDumpGapMs && last_dump_ms.compare_exchange_strong(dumped, now)) {
+      crackdown::RequestTelemetryDump();
     }
   }
 };
