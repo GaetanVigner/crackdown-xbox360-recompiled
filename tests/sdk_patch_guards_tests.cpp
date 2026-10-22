@@ -63,6 +63,18 @@ void TestMassiveCountHookIsWired() {
   CHECK(cmake.find("src/massive_server_guard.cpp") != std::string::npos);
 }
 
+// The audio grid guard (issue #8, the read at 0x72D32F98) must stay wired to its hook.
+void TestVisibilityGridHookIsWired() {
+  const std::filesystem::path root = std::filesystem::path(CRACKDOWN_PATCH_DIR) / "../..";
+  const std::string overrides = check::ReadText(root / "config/overrides.toml");
+  const size_t hook = overrides.find("address = 0x822541D8");
+  CHECK(hook != std::string::npos);
+  CHECK(overrides.find("name = \"crackdown_visibility_grid_guard\"", hook) != std::string::npos);
+  CHECK(overrides.find("registers = [\"r11\", \"r10\", \"r27\", \"r29\"]", hook) != std::string::npos);
+  const std::string cmake = check::ReadText(root / "CMakeLists.txt");
+  CHECK(cmake.find("src/visibility_grid_guard.cpp") != std::string::npos);
+}
+
 void TestXamLaunchTitleOwnsPath() {
   const std::string patch = ReadPatch("0086-");
   CHECK(!patch.empty());
@@ -74,6 +86,7 @@ void TestXamLaunchTitleOwnsPath() {
 void TestCompareStringNUsesRealLengths() {
   const std::string patch = ReadPatch("0087-");
   CHECK(!patch.empty());
+  CHECK(patch.find("src/kernel/xboxkrnl/xboxkrnl_rtl.cpp") != std::string::npos);
   CHECK(HasLine(patch, "-  auto len = std::min(string_1_len, string_2_len);"));
   CHECK(HasLine(patch, "+  auto len = std::min(len1, len2);"));
   CHECK(HasLine(patch, "+    ret = int(len1) - int(len2);"));
@@ -94,10 +107,26 @@ void TestD3D12TextureSliceSizeInitialised() {
 }
 
 void TestUnusedResolveCountersRemoved() {
+  // 0090 changes a class layout inside the GPU plugin: it must only drop the two dead counters.
   const std::string patch = ReadPatch("0090-");
   CHECK(!patch.empty());
+  CHECK(patch.find("include/rex/graphics/d3d12/render_target_cache.h") != std::string::npos);
   CHECK(HasLine(patch, "-  uint64_t direct_resolve_success_count_ = 0;"));
   CHECK(HasLine(patch, "-  uint64_t direct_resolve_fallback_count_ = 0;"));
+  size_t removed = 0;
+  size_t added = 0;
+  size_t line_start = 0;
+  while (line_start < patch.size()) {
+    size_t line_end = patch.find('\n', line_start);
+    if (line_end == std::string::npos) line_end = patch.size();
+    const std::string line = patch.substr(line_start, line_end - line_start);
+    line_start = line_end + 1;
+    if (line.rfind("---", 0) == 0 || line.rfind("+++", 0) == 0) continue;
+    if (line.rfind("-", 0) == 0) ++removed;
+    if (line.rfind("+", 0) == 0) ++added;
+  }
+  CHECK(removed == 2);
+  CHECK(added == 0);
 }
 
 void TestMakePacketType0SetsOneRegister() {
@@ -412,6 +441,7 @@ int main() {
   TestXamEnumerateCountStartsAtZero();
   TestPatchedSourceHasNoUninitialisedCount();
   TestMassiveCountHookIsWired();
+  TestVisibilityGridHookIsWired();
   TestLedgeSnapDownHookIsWired();
   TestRagdollPoseDtHookIsWired();
   TestCameraLiftDivisorHookIsWired();

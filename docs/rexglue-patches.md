@@ -5,8 +5,8 @@ result is installed over the stock files in `tools/rexglue`. The game compiles a
 must not move virtual functions or data members of classes the generated game code uses.
 
 `NNNN-name.patch` applies on both platforms, `NNNN-name.windows.patch` only on Windows and `NNNN-name.linux.patch` only on
-Linux. Numbers are unique and patches apply in name order; gaps are fine. 55 patches are common, 25 are Windows only and
-13 are Linux only, so 80 apply on Windows and 68 apply on Linux. Patches 0005, 0052 and 0095 change the code generator and
+Linux. Numbers are unique and patches apply in name order; gaps are fine. 59 patches are common, 25 are Windows only and
+13 are Linux only, so 84 apply on Windows and 72 apply on Linux. Patches 0005, 0052 and 0095 change the code generator and
 are the reason `tools\codegen.ps1` builds its own `rexglue.exe`; the rest change the runtime and the GPU plugin.
 
 | # | Platform | Purpose |
@@ -94,6 +94,10 @@ are the reason `tools\codegen.ps1` builds its own `rexglue.exe`; the rest change
 | 0100 | windows | the texture cache indexes its textures by base page, so `FindResolveCopyTargets` looks at the textures on the resolve's page instead of scanning all of them on every resolve. Portable, but Windows only until a Linux build checks it |
 | 0101 | windows | D3D12 per-draw loops: vertex buffer residency is invalidated a 64-bit mask at a time instead of a bit at a time, the used float constants are copied a run of consecutive constants per `memcpy`, and the stencil tile bits are read and added in up to two contiguous runs that vectorize instead of a byte at a time with wrapping |
 | 0102 | windows | profile-guided optimization of the GPU plugin in Release: `REXGPU_PGO_USE` names a merged profile to optimize it with, and `tools\rexruntime-patch.ps1` sets it to `patches\rexglue-sdk-pgo\rexgpu-xenos.profdata` when that file exists (see [build-workflow.md](build-workflow.md#profile-guided-optimization-of-the-gpu-plugin)) |
+| 0103 | all | Tracy zones and the perf counters only in Debug (they were in every configuration but Release): they cost the GPU command processor about a tenth of its time, so RelWithDebInfo, the profiling build, now performs like Release. The Tracy DLL is still built and staged; the game, compiled against the stock headers, still has its (inactive) zones |
+| 0104 | all | the base and mip extents of a texture key's guest layout, needed on every binding change at a draw resolution scale, come from a 1024-entry direct-mapped table (about 4% of the command processor thread) |
+| 0105 | all | `gpu_frame_stats` (off): every 10 s, logs what the guest command stream asked per frame (draws, resolves, type-0/type-3 packets and their registers, indirect buffers, constant registers by source, shader loads, texture lookups and creations), counted with plain increments on the command processor thread |
+| 0106 | all | `gpu_draw_trace` = <file> (cleared once done) records the next `gpu_draw_trace_frames` frames (default 1) from a swap: per draw or resolve, the draw initiator, index buffer, predication and visibility-query kill, the first ucode dwords of both shaders, and the raw render-state, float, fetch and bool/loop constant registers (about 12 KB a draw). HLE renderer milestone 1 compares it with the game-side capture of the D3D device |
 
 Patches 0054 to 0058, 0078 to 0083, 0095 and 0096 and the hooks in `src/audio_guest_sync.cpp` are adapted from
 Unowa001/crackdown-recomp (BSD 3-Clause, notice in [THIRD-PARTY-LICENSES.txt](../packaging/licenses/THIRD-PARTY-LICENSES.txt)).
@@ -122,3 +126,44 @@ The title's frame timer (`sub_823263D8`, hooked in `src/frame_pacing.cpp`) keeps
 the fixed step off it published 0 ms at `0x82D99128` on almost every other 60 FPS frame; a camera mode change on such a
 frame divided by it, and the camera, the player and the audio listener went NaN. With the fixed step off the hook
 publishes the port's own frame time instead, never 0.
+
+### Measured causes of the high frame rate fixes
+
+- Ledge snap-down: the follower divides its pull by the step's dt, and the Havok proxy turned that vertical velocity
+  into speed along the slope, which ran away about 1.64x per step at 120 FPS (the launches on slopes and off ledges).
+- First gravity step: a grounded step resets the vertical speed accumulator, so settling and sliding ran at g * dt,
+  four times slower at 120 FPS, long enough for the ledge follower to stop horizontal motion (the stuck-in-walls
+  reports).
+- Ragdoll restart: body start velocities are (pose - previous pose) / dt, and the previous pose stops updating while
+  ragdolled; a second hit differenced a stale pair over one 1/120 s step, 160-270 m/s, through floors.
+- Projectile ray: rockets and grenade rounds detect impacts only with one ray of launch velocity * dt, and Havok
+  contacts never detonate them; at 1/120 s the ray barely passed the rocket's nose, so the rocket vanished.
+
+### Guards (`src/visibility_grid_guard.cpp`, `src/nan_guards.cpp`)
+
+- `crackdown_visibility_grid_guard` (`0x822541D8`, AudioCore `sub_82252150`): a NaN listener angle converted by `fctiwz`
+  made the audio occlusion grid read 256 MB below its table (`Unhandled guest access violation ... 0x72D32F98`, issue
+  #8). Spans that would leave the table are clamped; the title's own reads near it are untouched.
+- `sub_824FD840` wrapper: the player's aim point (from the camera ray or a locked target's bone) is kept finite; a
+  target whose body went NaN (a ragdoll that blew up) no longer feeds NaN into the look-at target, head and listener.
+- `crackdown_look_target_guard` (`0x822A026C`, `0x822A2C50`) and `crackdown_audio_listener_guard` (`0x82252134`) repair
+  a non-finite x, y or z (the w lanes hold garbage in the shipped game and are left alone).
+- `sub_82287130` wrapper (camera update): a camera that comes out with a non-finite basis, position or listener point
+  (seen on the step a ragdoll starts) is put back to its state before the update; a NaN camera made the stick useless.
+- `crackdown_camera_lift_divisor` (`0x8228FDDC`, `sub_8228F990`): the above-water push divides by the camera forward
+  axis's y; a level camera no longer makes it infinite.
+
+### Hang watchdog (`src/hang_watchdog.cpp`)
+
+When the window stops answering messages for 5 s, or the title produces no frame for 10 s while in the foreground,
+every thread's call stack (symbolized from the PDB) is written to `hang_<n>.txt` in the session logs folder.
+
+### Developer diagnostics (all off by default, set in `settings.toml`)
+
+| Setting | Key | What it writes |
+|---|---|---|
+| `crackdown_physics_telemetry = true` | F9 | the last ~34 s of the player's and driven vehicle's raw state, `telemetry_<n>.bin`, also on the first NaN repair of a kind (one dump per 20 s) |
+| `crackdown_debug_profiler = true` | F6 | a 10 s sampling profile of every thread using 5% of a core or more, `profile_<n>.txt` (self and total time per function) |
+| `crackdown_hle_capture = true` | F8 | the HLE renderer's milestone 1 capture: `hle_game_<n>.bin` (D3D device state after every draw call) and `hle_gpu_<n>.bin` (`gpu_draw_trace`, 0106), compared with `tools/hle-trace-compare.ps1` |
+| `crackdown_debug_frame_dips = <ms>` | | delays frames by up to that many ms (100 at most), sweeping every 6 s with jitter and rare stalls, to test physics under frame rate dips |
+| `gpu_frame_stats = true` | | every 10 s, per frame: draws, resolves, packets, constant registers, shader loads and texture lookups (0105) |

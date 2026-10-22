@@ -1,0 +1,67 @@
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
++#include <memory>
+ #include <mutex>
+ #include <utility>
+ 
+@@ -137,6 +139,37 @@
+ 
+ namespace {
+ 
++// The base and mip extents of a key's guest layout, a pure function of the key. FindOrCreateTexture
++// needs them on every binding change at a draw resolution scale, where computing the whole layout
++// was about 4% of the command processor thread; a small direct-mapped table keeps the last ones.
++// Only the command processor thread binds textures, so the table is per thread and unlocked.
++struct GuestLayoutExtents {
++  uint32_t base_bytes;
++  uint32_t mips_bytes;
++};
++
++template <typename Key>
++GuestLayoutExtents GetGuestLayoutExtentsCached(const Key& key) {
++  static_assert(sizeof(Key) == 16, "TextureKey is hashed as two 64-bit words");
++  struct Entry {
++    Key key;  // Default-constructed keys are invalid, and only valid keys are looked up.
++    GuestLayoutExtents extents;
++  };
++  constexpr size_t kEntryCount = 1024;
++  thread_local std::unique_ptr<Entry[]> entries(new Entry[kEntryCount]);
++  uint64_t words[2];
++  std::memcpy(words, &key, sizeof(words));
++  const uint64_t hash = (words[0] ^ (words[1] * UINT64_C(0x9E3779B97F4A7C15))) *
++                        UINT64_C(0xD6E8FEB86659FD93);
++  Entry& entry = entries[size_t(hash >> 54) & (kEntryCount - 1)];
++  if (!(entry.key == key)) {
++    const texture_util::TextureGuestLayout layout = key.GetGuestLayout();
++    entry.key = key;
++    entry.extents = {layout.base.level_data_extent_bytes, layout.mips_total_extent_bytes};
++  }
++  return entry.extents;
++}
++
+ InvalidFetchLogDecision CheckInvalidTextureFetchLog(const xenos::xe_gpu_texture_fetch_t& fetch) {
+   static std::mutex mutex;
+   static InvalidFetchLogTracker tracker;
+@@ -878,13 +911,9 @@
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   // Check if the texture is a scaled resolve texture.
+   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
+-         IsRangeScaledResolved(key.base_page << 12,
+-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
+-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
+-         IsRangeScaledResolved(key.mip_page << 12,
+-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
++    const GuestLayoutExtents extents = GetGuestLayoutExtentsCached(key);
++    if ((extents.base_bytes && IsRangeScaledResolved(key.base_page << 12, extents.base_bytes)) ||
++        (extents.mips_bytes && IsRangeScaledResolved(key.mip_page << 12, extents.mips_bytes))) {
+       key.scaled_resolve = 1;
+     }
+   }

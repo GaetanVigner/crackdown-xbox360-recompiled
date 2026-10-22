@@ -1,0 +1,235 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <bitset>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -24,6 +25,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
++#include <rex/graphics/gpu_frame_stats.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/guest_wake.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+@@ -88,11 +90,51 @@
+                     "threads. This reduces stutter but may cause brief visual artifacts while "
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(gpu_frame_stats, false, "GPU",
++                    "Log every 10 s what the guest command stream asked per frame: draws, "
++                    "resolves, packets, constant registers, shader loads and texture lookups")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+ 
++GpuFrameStats g_gpu_frame_stats{};
++
++void GpuFrameStatsSwap() {
++  GpuFrameStats& stats = g_gpu_frame_stats;
++  ++stats.frames;
++  static std::chrono::steady_clock::time_point start;
++  const auto now = std::chrono::steady_clock::now();
++  if (!REXCVAR_GET(gpu_frame_stats) || start == std::chrono::steady_clock::time_point()) {
++    stats = {};
++    start = REXCVAR_GET(gpu_frame_stats) ? now : std::chrono::steady_clock::time_point();
++    return;
++  }
++  const double seconds = std::chrono::duration<double>(now - start).count();
++  if (seconds < 10.0) {
++    return;
++  }
++  const double frames = double(stats.frames);
++  auto per_frame = [frames](uint64_t value) { return double(value) / frames; };
++  REXGPU_INFO(
++      "Frame stats over {:.1f} s at {:.1f} FPS, per frame: {:.0f} draws, {:.1f} resolves, "
++      "{:.0f} type-0 packets ({:.0f} registers), {:.0f} type-3 packets, {:.1f} indirect "
++      "buffers; constant registers from the ring {:.0f} ALU / {:.0f} fetch / {:.0f} "
++      "bool+loop, from memory {:.0f} ALU / {:.0f} fetch / {:.0f} bool+loop; {:.1f} shader "
++      "loads, {:.0f} texture lookups, {:.2f} textures created",
++      seconds, frames / seconds, per_frame(stats.draws), per_frame(stats.resolves),
++      per_frame(stats.packets_type0), per_frame(stats.type0_registers),
++      per_frame(stats.packets_type3), per_frame(stats.indirect_buffers),
++      per_frame(stats.ring_alu_registers), per_frame(stats.ring_fetch_registers),
++      per_frame(stats.ring_bool_loop_registers), per_frame(stats.memory_alu_registers),
++      per_frame(stats.memory_fetch_registers), per_frame(stats.memory_bool_loop_registers),
++      per_frame(stats.shader_loads), per_frame(stats.texture_lookups),
++      per_frame(stats.textures_created));
++  stats = {};
++  start = now;
++}
++
+ namespace {
+ 
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -708,6 +750,7 @@
+ 
+ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
++  ++g_gpu_frame_stats.indirect_buffers;
+ 
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+@@ -767,6 +810,8 @@
+   // (base_index << 2).
+ 
+   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
++  ++g_gpu_frame_stats.packets_type0;
++  g_gpu_frame_stats.type0_registers += count;
+   if (reader->read_count() < count * sizeof(uint32_t)) {
+     REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
+                  reader->read_count(), count * sizeof(uint32_t));
+@@ -810,6 +855,7 @@
+   // Type-3 packet.
+   uint32_t opcode = (packet >> 8) & 0x7F;
+   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
++  ++g_gpu_frame_stats.packets_type3;
+   auto data_start_offset = reader->read_offset();
+ 
+   if (reader->read_count() < count * sizeof(uint32_t)) {
+@@ -1006,6 +1052,7 @@
+ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
++  GpuFrameStatsSwap();
+ 
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   {
+@@ -1466,6 +1513,11 @@
+ 
+       bool major_mode_explicit =
+           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
++      if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
++        ++g_gpu_frame_stats.resolves;
++      } else {
++        ++g_gpu_frame_stats.draws;
++      }
+       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+       if (!draw_succeeded) {
+@@ -1527,15 +1579,19 @@
+   uint32_t count_registers = count - 1;
+   switch (type) {
+     case 0:  // ALU
++      g_gpu_frame_stats.ring_alu_registers += count_registers;
+       WriteALURangeFromRing(reader, index, count_registers);
+       break;
+     case 1:  // FETCH
++      g_gpu_frame_stats.ring_fetch_registers += count_registers;
+       WriteFetchRangeFromRing(reader, index, count_registers);
+       break;
+     case 2:  // BOOL
++      g_gpu_frame_stats.ring_bool_loop_registers += count_registers;
+       WriteBoolRangeFromRing(reader, index, count_registers);
+       break;
+     case 3:  // LOOP
++      g_gpu_frame_stats.ring_bool_loop_registers += count_registers;
+       WriteLoopRangeFromRing(reader, index, count_registers);
+       break;
+     case 4:  // REGISTERS
+@@ -1570,15 +1626,19 @@
+   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
+   switch (type) {
+     case 0:  // ALU
++      g_gpu_frame_stats.memory_alu_registers += size_dwords;
+       WriteALURangeFromMem(index, xlat_address, size_dwords);
+       break;
+     case 1:  // FETCH
++      g_gpu_frame_stats.memory_fetch_registers += size_dwords;
+       WriteFetchRangeFromMem(index, xlat_address, size_dwords);
+       break;
+     case 2:  // BOOL
++      g_gpu_frame_stats.memory_bool_loop_registers += size_dwords;
+       WriteBoolRangeFromMem(index, xlat_address, size_dwords);
+       break;
+     case 3:  // LOOP
++      g_gpu_frame_stats.memory_bool_loop_registers += size_dwords;
+       WriteLoopRangeFromMem(index, xlat_address, size_dwords);
+       break;
+     case 4:  // REGISTERS
+@@ -1612,6 +1672,7 @@
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
++  ++g_gpu_frame_stats.shader_loads;
+   auto shader =
+       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+   switch (shader_type) {
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
++#include <rex/graphics/gpu_frame_stats.h>
+ #include <rex/graphics/pipeline/texture/cache.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/pipeline/texture/invalid_fetch_log.h>
+@@ -909,6 +910,7 @@
+ }
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
++  ++g_gpu_frame_stats.texture_lookups;
+   // Check if the texture is a scaled resolve texture.
+   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+     const GuestLayoutExtents extents = GetGuestLayoutExtentsCached(key);
+@@ -1010,6 +1012,7 @@
+   // Create the texture and add it to the map.
+   Texture* texture;
+   {
++    ++g_gpu_frame_stats.textures_created;
+     std::unique_ptr<Texture> new_texture = CreateTexture(key);
+     if (!new_texture) {
+       key.LogAction("Failed to create");
+diff --git a/include/rex/graphics/gpu_frame_stats.h b/include/rex/graphics/gpu_frame_stats.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/graphics/gpu_frame_stats.h
+@@ -0,0 +1,39 @@
++/**
++ * @file        graphics/gpu_frame_stats.h
++ * @brief       Per-frame command stream counters for the GPU command processor (gpu_frame_stats).
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::graphics {
++
++// What the guest's command stream asks of the command processor, counted between swaps. Plain
++// increments on the command processor thread (the only thread that runs packets and binds
++// textures); with gpu_frame_stats on, GpuFrameStatsSwap logs per-frame averages every 10 s.
++struct GpuFrameStats {
++  uint64_t frames;
++  uint64_t draws;
++  uint64_t resolves;
++  uint64_t packets_type0;
++  uint64_t packets_type3;
++  uint64_t type0_registers;
++  uint64_t indirect_buffers;
++  // SET_CONSTANT (from the ring) and LOAD_ALU_CONSTANT (from memory), in registers.
++  uint64_t ring_alu_registers;
++  uint64_t ring_fetch_registers;
++  uint64_t ring_bool_loop_registers;
++  uint64_t memory_alu_registers;
++  uint64_t memory_fetch_registers;
++  uint64_t memory_bool_loop_registers;
++  uint64_t shader_loads;
++  uint64_t texture_lookups;
++  uint64_t textures_created;
++};
++
++extern GpuFrameStats g_gpu_frame_stats;
++
++// Called at every guest swap.
++void GpuFrameStatsSwap();
++
++}  // namespace rex::graphics

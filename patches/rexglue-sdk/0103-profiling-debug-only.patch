@@ -1,0 +1,58 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..2cd5c7a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,12 +23,13 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+-# Propagate profiling defines globally (compiled out in Release)
++# Propagate profiling defines globally (Debug only: Tracy zones and the perf counters cost the GPU command
++# processor about a tenth of its time, so RelWithDebInfo must perform like Release to be worth profiling)
+ if(REXGLUE_ENABLE_TRACY)
+-    add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
++    add_compile_definitions($<$<CONFIG:Debug>:REXGLUE_ENABLE_PROFILING>)
+ endif()
+ if(REXGLUE_ENABLE_PERF_COUNTERS)
+-    add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
++    add_compile_definitions($<$<CONFIG:Debug>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
+ 
+ # Graphics backend selection
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..aef5440 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -127,11 +127,11 @@ if(REXGLUE_ENABLE_TRACY)
+     target_link_libraries(rexcore PUBLIC
+         $<$<NOT:$<CONFIG:Release>>:$<TARGET_NAME:TracyClient>>)
+     target_compile_definitions(rexcore PUBLIC
+-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
++        $<$<CONFIG:Debug>:REXGLUE_ENABLE_PROFILING>)
+ endif()
+ 
+ if(REXGLUE_ENABLE_PERF_COUNTERS)
+     target_sources(rexcore PRIVATE perf/counter.cpp)
+     target_compile_definitions(rexcore PUBLIC
+-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
++        $<$<CONFIG:Debug>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..39367aa 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -97,12 +97,12 @@ if(REXGLUE_ENABLE_TRACY)
+     target_link_libraries(rexruntime PUBLIC
+         $<$<NOT:$<CONFIG:Release>>:$<TARGET_NAME:TracyClient>>)
+     target_compile_definitions(rexruntime PUBLIC
+-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
++        $<$<CONFIG:Debug>:REXGLUE_ENABLE_PROFILING>)
+ endif()
+ 
+ if(REXGLUE_ENABLE_PERF_COUNTERS)
+     target_compile_definitions(rexruntime PUBLIC
+-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
++        $<$<CONFIG:Debug>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
+ 
+ if(WIN32)
