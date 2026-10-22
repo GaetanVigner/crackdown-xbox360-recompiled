@@ -33,6 +33,8 @@
 #include "glyph_overlay.h"
 #include "guest_fault_log.h"
 #include "hang_watchdog.h"
+#include "hle_capture.h"
+#include "physics_telemetry.h"
 #include "internal_render_scale.h"
 #include "language_setting.h"
 #include "launcher.h"
@@ -253,6 +255,9 @@ class CrackdownApp : public rex::ReXApp {
     if (window()) {
       cheat_menu_key_ = std::make_unique<crackdown::CheatMenuKey>(
           window(), [this] { app_context().CallInUIThreadDeferred([this] { ToggleCheatMenu(); }); });
+      profile_key_ = std::make_unique<crackdown::ProfileKey>(window());
+      hle_capture_key_ = std::make_unique<crackdown::HleCaptureKey>(window());
+      telemetry_key_ = std::make_unique<crackdown::TelemetryKey>(window());
     }
   }
 
@@ -261,6 +266,9 @@ class CrackdownApp : public rex::ReXApp {
   void OnShutdown() override {
     CloseAchievements();
     cheat_menu_key_.reset();
+    profile_key_.reset();
+    hle_capture_key_.reset();
+    telemetry_key_.reset();
     CloseCheatMenu();
     crackdown::mouse_look::Uninstall();
     DetachWindowHost();
@@ -430,6 +438,9 @@ class CrackdownApp : public rex::ReXApp {
   std::unique_ptr<crackdown::AchievementsOverlay> achievements_;
   std::unique_ptr<crackdown::CheatMenuOverlay> cheat_menu_;
   std::unique_ptr<crackdown::CheatMenuKey> cheat_menu_key_;
+  std::unique_ptr<crackdown::ProfileKey> profile_key_;
+  std::unique_ptr<crackdown::HleCaptureKey> hle_capture_key_;
+  std::unique_ptr<crackdown::TelemetryKey> telemetry_key_;
   bool show_launcher_ = false;
   bool show_launcher_after_runtime_ = false;
   bool launcher_open_ = false;

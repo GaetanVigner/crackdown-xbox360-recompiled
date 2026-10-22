@@ -1,0 +1,196 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -142,6 +142,11 @@
+   };
+ 
+   void WorkerThreadMain();
++
++  // gpu_draw_trace (HLE renderer milestone 1): called at every swap and before every draw.
++  void DrawTraceSwap();
++  void DrawTraceDraw(uint32_t packet, uint32_t draw_initiator,
++                     const IndexBufferInfo* index_buffer_info, bool killed);
+   virtual bool SetupContext() = 0;
+   virtual void ShutdownContext() = 0;
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -14,7 +14,9 @@
+ #include <chrono>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
++#include <string>
+ #include <string_view>
+ 
+ #include <fmt/format.h>
+@@ -90,6 +92,12 @@
+                     "threads. This reduces stutter but may cause brief visual artifacts while "
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(gpu_draw_trace, "", "GPU",
++                      "Developer diagnostics: write the register state of every draw of the next "
++                      "gpu_draw_trace_frames frames to this file, then clear it")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_draw_trace_frames, 1, "GPU", "Frames a gpu_draw_trace records")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(gpu_frame_stats, false, "GPU",
+                     "Log every 10 s what the guest command stream asked per frame: draws, "
+                     "resolves, packets, constant registers, shader loads and texture lookups")
+@@ -135,6 +143,125 @@
+   start = now;
+ }
+ 
++// --- Draw trace (gpu_draw_trace) -----------------------------------------------------------------
++//
++// HLE renderer milestone 1 compares, draw by draw, the state the game's D3D device holds with the
++// register state this command processor sees. With gpu_draw_trace set to a file path, the next
++// gpu_draw_trace_frames frames (from a swap) are written there, then the path is cleared.
++//
++// File: "GDTR", u32 version, u32 block count, then per block {u32 first register, u32 count}. Then
++// records: u32 kind (1 draw, 2 resolve, 3 swap), u32 frame, u32 sequence in the frame, u32 guest
++// physical address of the DRAW packet (the same for each tile of a predicated replay), u32 VGT
++// draw initiator, u32 index guest base, u32 index count, u32 index format, u32 predicated (the
++// packet's predicate bit), u32 bin_select low, u32 bin_mask low, u32 visibility-query kill, u32 VS
++// dword count, 8 x u32 VS first dwords, u32 PS dword count, 8 x u32 PS first dwords, then the
++// registers of each block, all host order. Swap records carry only the first three fields' worth
++// of header and no registers.
++namespace {
++
++constexpr uint32_t kDrawTraceVersion = 2;
++struct DrawTraceBlock {
++  uint32_t first;
++  uint32_t count;
++};
++constexpr DrawTraceBlock kDrawTraceBlocks[] = {
++    {0x2000, 0x300},  // render state
++    {XE_GPU_REG_SHADER_CONSTANT_000_X, 2048},
++    {XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192},
++    {XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, 40},
++};
++
++struct DrawTrace {
++  std::FILE* file = nullptr;
++  uint32_t frame = 0;
++  uint32_t frames_left = 0;
++  uint32_t sequence = 0;
++  // Guest physical address of the type-3 packet being executed (set while recording).
++  uint32_t packet_physical = 0;
++  std::string path;
++};
++DrawTrace g_draw_trace;
++
++void WriteU32(std::FILE* file, uint32_t value) { std::fwrite(&value, sizeof(value), 1, file); }
++
++void WriteShaderHead(std::FILE* file, const Shader* shader) {
++  const uint32_t count = shader ? uint32_t(shader->ucode_dword_count()) : 0;
++  WriteU32(file, count);
++  for (uint32_t i = 0; i < 8; ++i) {
++    WriteU32(file, i < count ? shader->ucode_dwords()[i] : 0);
++  }
++}
++
++}  // namespace
++
++void CommandProcessor::DrawTraceSwap() {
++  DrawTrace& trace = g_draw_trace;
++  if (trace.file) {
++    WriteU32(trace.file, 3);
++    WriteU32(trace.file, trace.frame);
++    WriteU32(trace.file, trace.sequence);
++    ++trace.frame;
++    trace.sequence = 0;
++    if (--trace.frames_left == 0) {
++      std::fclose(trace.file);
++      trace.file = nullptr;
++      REXGPU_INFO("Draw trace: {} frame(s) written to {}", trace.frame, trace.path);
++    }
++    return;
++  }
++  const std::string path = REXCVAR_GET(gpu_draw_trace);
++  if (path.empty()) {
++    return;
++  }
++  rex::cvar::SetFlagByName("gpu_draw_trace", "");
++  trace.file = std::fopen(path.c_str(), "wb");
++  if (!trace.file) {
++    REXGPU_ERROR("Draw trace: cannot open {}", path);
++    return;
++  }
++  trace.path = path;
++  trace.frame = 0;
++  trace.sequence = 0;
++  trace.frames_left = uint32_t(std::max(1, REXCVAR_GET(gpu_draw_trace_frames)));
++  std::setvbuf(trace.file, nullptr, _IOFBF, 1 << 20);
++  std::fwrite("GDTR", 4, 1, trace.file);
++  WriteU32(trace.file, kDrawTraceVersion);
++  WriteU32(trace.file, uint32_t(std::size(kDrawTraceBlocks)));
++  for (const DrawTraceBlock& block : kDrawTraceBlocks) {
++    WriteU32(trace.file, block.first);
++    WriteU32(trace.file, block.count);
++  }
++  REXGPU_INFO("Draw trace: recording {} frame(s) to {}", trace.frames_left, path);
++}
++
++void CommandProcessor::DrawTraceDraw(uint32_t packet, uint32_t draw_initiator,
++                                     const IndexBufferInfo* index_buffer_info, bool killed) {
++  DrawTrace& trace = g_draw_trace;
++  if (!trace.file) {
++    return;
++  }
++  const bool resolve =
++      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
++  std::FILE* file = trace.file;
++  WriteU32(file, resolve ? 2 : 1);
++  WriteU32(file, trace.frame);
++  WriteU32(file, trace.sequence++);
++  WriteU32(file, trace.packet_physical);
++  WriteU32(file, draw_initiator);
++  WriteU32(file, index_buffer_info ? index_buffer_info->guest_base : 0);
++  WriteU32(file, index_buffer_info ? index_buffer_info->count : 0);
++  WriteU32(file, index_buffer_info ? uint32_t(index_buffer_info->format) : 0);
++  WriteU32(file, packet & 1);
++  WriteU32(file, uint32_t(bin_select_));
++  WriteU32(file, uint32_t(bin_mask_));
++  WriteU32(file, killed ? 1 : 0);
++  WriteShaderHead(file, active_vertex_shader_);
++  WriteShaderHead(file, active_pixel_shader_);
++  for (const DrawTraceBlock& block : kDrawTraceBlocks) {
++    std::fwrite(register_file_->values + block.first, sizeof(uint32_t), block.count, file);
++  }
++}
++
+ namespace {
+ 
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -857,6 +984,11 @@
+   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+   ++g_gpu_frame_stats.packets_type3;
+   auto data_start_offset = reader->read_offset();
++  if (g_draw_trace.file) {
++    const size_t header = (data_start_offset + reader->capacity() - sizeof(uint32_t)) % reader->capacity();
++    g_draw_trace.packet_physical =
++        uint32_t(reader->buffer() + header - memory_->physical_membase()) & 0x1FFFFFFF;
++  }
+ 
+   if (reader->read_count() < count * sizeof(uint32_t)) {
+     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
+@@ -1053,6 +1185,7 @@
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+   GpuFrameStatsSwap();
++  DrawTraceSwap();
+ 
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   {
+@@ -1505,6 +1638,8 @@
+ 
+   if (draw_succeeded) {
+     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
++    DrawTraceDraw(packet, vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr,
++                  viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z);
+     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+       // TODO(Triang3l): Don't drop the draw call completely if the vertex
+       // shader has memexport.

@@ -28,6 +28,8 @@
 #include "frame_timing.h"
 #include "glyph_overlay.h"
 #include "hang_watchdog.h"
+#include "hle_capture.h"
+#include "physics_telemetry.h"
 #include "settings.h"
 
 REXCVAR_DEFINE_INT32(crackdown_debug_frame_dips, 0, "Crackdown",
@@ -249,6 +251,7 @@ REX_HOOK_RAW(sub_826A7698) {
   }
   crackdown::UpdateButtonGlyphs(base);
   crackdown::NoteGuestFrame();
+  crackdown::HleCaptureFrame();
   __imp__sub_826A7698(ctx, base);
 }
 
@@ -256,7 +259,9 @@ REX_HOOK_RAW(sub_826A7698) {
 // on an on-time frame at every rate, so this is a no-op multiply unless a frame ran long or short of its target.
 REX_HOOK_RAW(sub_826A6B50) {
   ctx.f1.f64 = double(float(ctx.f1.f64 * g_step.original_steps));
+  const double step_seconds = ctx.f1.f64;
   __imp__sub_826A6B50(ctx, base);
+  crackdown::RecordPhysicsStep(base, step_seconds);
 }
 
 // The frame delta getter. With the fixed step on (30), the original always returns timescale/30, the same value

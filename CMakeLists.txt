@@ -201,6 +201,7 @@ set(CRACKDOWN_SOURCES
     src/graphics_adapters.cpp
     src/guest_fault_log.cpp
     src/hang_watchdog.cpp
+    src/hle_capture.cpp
     src/launcher.cpp
     src/launcher_achievements.cpp
     src/launcher_achievements_page.cpp
@@ -210,6 +211,7 @@ set(CRACKDOWN_SOURCES
     src/massive_server_guard.cpp
     src/mouse_look.cpp
     src/nan_guards.cpp
+    src/physics_telemetry.cpp
     src/platform.cpp
     src/session_log.cpp
     src/settings.cpp
