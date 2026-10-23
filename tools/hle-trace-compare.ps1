@@ -110,6 +110,10 @@ public static class TraceCompare {
     static ulong Key(TraceRecord r) { return ((ulong)r.Packet << 32) | r.Initiator; }
     static readonly HashSet<uint> TileRegisters = new HashSet<uint> { 0x2000, 0x2104, 0x2203, 0x2080, 0x2081, 0x2082, 0x2208, 0x2180, 0x2181 };
 
+    // Game-side records carry their source in the visibility-query field (src/hle_capture.cpp).
+    static readonly string[] SourceNames = { "D3D draw", "command buffer", "GPR flush (internal)", "clear", "resolve" };
+    static string SourceName(uint source) { return source < SourceNames.Length ? SourceNames[source] : "source " + source; }
+
     static string Category(uint reg, TraceRecord gpu) {
         if (reg == 0x2102) return "VGT_INDX_OFFSET (never shadowed)";
         if (gpu.Predicated != 0 && TileRegisters.Contains(reg)) return "per-tile register of a predicated draw";
@@ -119,6 +123,15 @@ public static class TraceCompare {
         if (reg >= 0x4800 && reg < 0x48C0) return "fetch constant";
         if (reg >= 0x4900 && reg < 0x4928) return "bool/loop constant";
         return "render state";
+    }
+
+    static int Differences(TraceRecord g, TraceRecord r) {
+        int d = 0;
+        for (int i = 0; i < r.Registers.Length; ++i) {
+            uint expected = g.Registers[i];
+            if (expected != Unknown && expected != r.Registers[i]) ++d;
+        }
+        return d;
     }
 
     public static string Run(Trace game, Trace gpu, int top) {
@@ -135,6 +148,22 @@ public static class TraceCompare {
             if (!gameByFrame.TryGetValue(r.Frame, out frame)) gameByFrame[r.Frame] = frame = new Dictionary<ulong, TraceRecord>();
             if (!frame.ContainsKey(Key(r))) frame[Key(r)] = r;
         }
+        // Every game draw of a key: a command buffer replayed for several instances, or one draw function called for
+        // several objects, shares the packet address and initiator. A GPU draw pairs with the occurrence it differs
+        // least from (ties go to the occurrence in submission order).
+        var gameOccurrences = new Dictionary<uint, Dictionary<ulong, List<TraceRecord>>>();
+        foreach (var r in game.Draws) {
+            if (r.Packet == 0) continue;
+            Dictionary<ulong, List<TraceRecord>> frame;
+            if (!gameOccurrences.TryGetValue(r.Frame, out frame)) gameOccurrences[r.Frame] = frame = new Dictionary<ulong, List<TraceRecord>>();
+            List<TraceRecord> list;
+            if (!frame.TryGetValue(Key(r), out list)) frame[Key(r)] = list = new List<TraceRecord>();
+            list.Add(r);
+        }
+        var gpuSeen = new Dictionary<ulong, int>();
+        int multiInstance = 0, reordered = 0;
+        // GPU executions of each paired device draw: predicated tiling replays a draw once per tile it covers.
+        var executions = new Dictionary<TraceRecord, int>();
         int unparsedGame = game.Draws.Count(r => r.Packet == 0);
 
         // Align each GPU frame with the game frame sharing the most keys.
@@ -160,6 +189,12 @@ public static class TraceCompare {
         var unmatchedSamples = new List<string>();
         var unmatchedByInitiator = new Dictionary<string, int>();
         var unmatchedByRegion = new Dictionary<uint, int>();
+        var pairedBySource = new Dictionary<string, int>();
+        var cleanBySource = new Dictionary<string, int>();
+        var categoriesBySource = new Dictionary<string, Dictionary<string, int>>();
+        // Float constants of D3D and command buffer draws: register -> draws, and one example.
+        var floatCount = new Dictionary<uint, int>();
+        var floatExample = new Dictionary<uint, string>();
         foreach (var r in gpu.Draws) {
             if (r.Kind == 2) { ++resolves; continue; }
             ++gpuDraws;
@@ -178,7 +213,27 @@ public static class TraceCompare {
                     unmatchedSamples.Add(string.Format("    GPU frame {0} #{1}: packet {2:X8} initiator {3:X8} predicated {4}", r.Frame, r.Sequence, r.Packet, r.Initiator, r.Predicated));
                 continue;
             }
+            var occurrences = gameOccurrences[aligned][Key(r)];
+            ulong seenKey = Key(r) ^ ((ulong)r.Frame << 61);
+            int seen; gpuSeen.TryGetValue(seenKey, out seen); gpuSeen[seenKey] = seen + 1;
+            if (occurrences.Count > 1) {
+                ++multiInstance;
+                int inOrder = seen % occurrences.Count;
+                int best = inOrder, bestDiff = Differences(occurrences[inOrder], r);
+                for (int k = 0; k < occurrences.Count && k < 256 && bestDiff > 0; ++k) {
+                    if (k == inOrder) continue;
+                    int d = Differences(occurrences[k], r);
+                    if (d < bestDiff) { bestDiff = d; best = k; }
+                }
+                if (best != inOrder) ++reordered;
+                g = occurrences[best];
+            }
             ++matched; usedGame.Add(g);
+            int ex; executions.TryGetValue(g, out ex); executions[g] = ex + 1;
+            string source = SourceName(g.Killed);
+            int ps; pairedBySource.TryGetValue(source, out ps); pairedBySource[source] = ps + 1;
+            Dictionary<string, int> sourceCategories;
+            if (!categoriesBySource.TryGetValue(source, out sourceCategories)) categoriesBySource[source] = sourceCategories = new Dictionary<string, int>();
             if (g.VsDwords == 0) ++vsUnknown;
             else if (g.VsDwords != r.VsDwords || !g.VsHead.SequenceEqual(r.VsHead)) ++vsMismatch;
             if (g.PsDwords == 0) ++psUnknown;
@@ -190,29 +245,59 @@ public static class TraceCompare {
                 uint reg = gpu.RegisterAt(i);
                 string category = Category(reg, r);
                 int c; categoryCount.TryGetValue(category, out c); categoryCount[category] = c + 1;
+                int sc; sourceCategories.TryGetValue(category, out sc); sourceCategories[category] = sc + 1;
+                if ((category == "VS float constant" || category == "PS float constant") && g.Killed <= 1) {
+                    int fc; floatCount.TryGetValue(reg, out fc); floatCount[reg] = fc + 1;
+                    if (!floatExample.ContainsKey(reg))
+                        floatExample[reg] = string.Format("device {0:X8} vs GPU {1:X8} ({2}, packet {3:X8}, predicated {4})", expected, r.Registers[i], SourceName(g.Killed), r.Packet, r.Predicated);
+                }
                 if (category != "render state" && category != "fetch constant" && category != "bool/loop constant") continue;
+                // The GPR flush draws use none of the game's state: the GPU holds the last flushed values there.
+                if (g.Killed == 2) { clean = false; continue; }
                 clean = false;
                 int n; mismatchCount.TryGetValue(reg, out n); mismatchCount[reg] = n + 1;
                 if (!mismatchExample.ContainsKey(reg))
                     mismatchExample[reg] = string.Format("device {0:X8} vs GPU {1:X8} (packet {2:X8})", expected, r.Registers[i], r.Packet);
             }
-            if (clean) ++cleanDraws;
+            if (clean) { ++cleanDraws; int cs; cleanBySource.TryGetValue(source, out cs); cleanBySource[source] = cs + 1; }
         }
         int gameNotExecuted = game.Draws.Count(r => r.Packet != 0 && alignment.ContainsValue(r.Frame) && !usedGame.Contains(r));
 
         o.AppendFormat("\nGPU draws: {0} ({1} killed by a visibility query), resolves: {2}.\n", gpuDraws, killed, resolves);
         o.AppendFormat("Paired with a device draw: {0} ({1:F1}%). Unpaired GPU draws: {2}. Device draws in aligned frames never executed: {3}. Device calls without a parsed packet: {4}.\n",
             matched, gpuDraws > 0 ? 100.0 * matched / gpuDraws : 0, unmatched, gameNotExecuted, unparsedGame);
+        o.AppendFormat("Paired draws whose key has several game occurrences: {0}; paired with an occurrence other than the one in submission order: {1}.\n",
+            multiInstance, reordered);
+        o.Append("GPU draws by bin select / bin mask (top 8):\n");
+        foreach (var b in gpu.Draws.Where(r => r.Kind == 1).GroupBy(r => ((ulong)r.BinSelect << 32) | r.BinMask).OrderByDescending(b => b.Count()).Take(8))
+            o.AppendFormat("  select {0:X8} mask {1:X8}: {2,7}\n", (uint)(b.Key >> 32), (uint)b.Key, b.Count());
+        o.Append("Device draws by GPU executions (tile replays) and source:\n");
+        foreach (var bucket in executions.GroupBy(e => new { e.Value, Source = SourceName(e.Key.Killed) }).OrderBy(b => b.Key.Source).ThenBy(b => b.Key.Value))
+            o.AppendFormat("  {0,-22} x{1}: {2,6} device draws, {3,7} GPU executions\n", bucket.Key.Source, bucket.Key.Value, bucket.Count(), bucket.Count() * bucket.Key.Value);
         o.AppendFormat("Of the unpaired GPU draws, {0} lie in the {1} command buffer replays (RunCommandBuffer) the game side logged.\n",
             inReplayedBuffers, game.IndirectBuffers.Count);
         o.AppendFormat("Shaders: VS differ in {0}, PS differ in {1} (device shader unknown: VS {2}, PS {3}).\n", vsMismatch, psMismatch, vsUnknown, psUnknown);
         o.AppendFormat("Paired draws whose render state, fetch and bool/loop constants all match: {0} ({1:F1}%).\n",
             cleanDraws, matched > 0 ? 100.0 * cleanDraws / matched : 0);
+        o.Append("\nBy source of the device draw (paired GPU executions, fully matching render state/fetch/bool-loop, differing register-draw pairs by category):\n");
+        foreach (var p in pairedBySource.OrderByDescending(p => p.Value)) {
+            int cs; cleanBySource.TryGetValue(p.Key, out cs);
+            o.AppendFormat("  {0,-22} {1,7} paired, {2,7} match ({3:F1}%)", p.Key, p.Value, cs, 100.0 * cs / p.Value);
+            Dictionary<string, int> cats;
+            if (categoriesBySource.TryGetValue(p.Key, out cats))
+                foreach (var c in cats.OrderByDescending(c => c.Value)) o.AppendFormat("; {0} {1}", c.Key, c.Value);
+            o.Append("\n");
+        }
         o.Append("\nDiffering registers by category (register-draw pairs):\n");
         foreach (var c in categoryCount.OrderByDescending(p => p.Value)) o.AppendFormat("  {0,10}  {1}\n", c.Value, c.Key);
         o.AppendFormat("\nTop {0} differing registers (render state, fetch, bool/loop):\n", top);
         foreach (var m in mismatchCount.OrderByDescending(p => p.Value).Take(top))
             o.AppendFormat("  0x{0:X4}  {1,8} draws  e.g. {2}\n", m.Key, m.Value, mismatchExample[m.Key]);
+        o.Append("\nTop differing float constants of D3D and command buffer draws (register: c index.component):\n");
+        foreach (var m in floatCount.OrderByDescending(p => p.Value).Take(top)) {
+            uint k = m.Key - 0x4000;
+            o.AppendFormat("  0x{0:X4} {1} c{2}.{3}  {4,8} draws  e.g. {5}\n", m.Key, k < 1024 ? "VS" : "PS", (k % 1024) / 4, "xyzw"[(int)(k % 4)], m.Value, floatExample[m.Key]);
+        }
         if (unmatchedSamples.Count > 0) {
             o.Append("\nUnpaired GPU draws by shape:\n");
             foreach (var p in unmatchedByInitiator.OrderByDescending(p => p.Value).Take(12)) o.AppendFormat("  {0,8}  {1}\n", p.Value, p.Key);
