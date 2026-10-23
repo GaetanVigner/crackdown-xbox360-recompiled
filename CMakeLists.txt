@@ -202,6 +202,7 @@ set(CRACKDOWN_SOURCES
     src/guest_fault_log.cpp
     src/hang_watchdog.cpp
     src/hle_capture.cpp
+    src/single_tile_scene.cpp
     src/launcher.cpp
     src/launcher_achievements.cpp
     src/launcher_achievements_page.cpp

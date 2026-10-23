@@ -26,6 +26,7 @@
 #include "guest_memory.h"
 #include "hang_watchdog.h"
 #include "platform.h"
+#include "single_tile_scene.h"
 
 REXCVAR_DEFINE_BOOL(crackdown_hle_capture, false, "Crackdown",
                     "Developer diagnostics (HLE renderer): F8 records the next frames from the D3D device (game side) "
@@ -571,21 +572,29 @@ void HleCaptureFrame() {
 // BeginIndexedVertices.
 REX_EXTERN(__imp__sub_826B9FF8);
 REX_HOOK_RAW(sub_826B9FF8) {
+  if (crackdown::SingleTileSuppressed()) return;
   crackdown::CaptureDraw(ctx, base, false, [&] { __imp__sub_826B9FF8(ctx, base); });
 }
 
 REX_EXTERN(__imp__sub_826B9C08);
 REX_HOOK_RAW(sub_826B9C08) {
+  if (crackdown::SingleTileSuppressed()) return;
   crackdown::CaptureDraw(ctx, base, false, [&] { __imp__sub_826B9C08(ctx, base); });
 }
 
 REX_EXTERN(__imp__sub_826B91E0);
 REX_HOOK_RAW(sub_826B91E0) {
+  // BeginVertices: every caller skips the vertex writes when it returns 0.
+  if (crackdown::SingleTileSuppressed()) {
+    ctx.r3.u64 = 0;
+    return;
+  }
   crackdown::CaptureDraw(ctx, base, true, [&] { __imp__sub_826B91E0(ctx, base); });
 }
 
 REX_EXTERN(__imp__sub_826B96D0);
 REX_HOOK_RAW(sub_826B96D0) {
+  if (crackdown::SingleTileSuppressed()) return;
   crackdown::CaptureDraw(ctx, base, true, [&] { __imp__sub_826B96D0(ctx, base); });
 }
 
@@ -594,11 +603,13 @@ REX_HOOK_RAW(sub_826B96D0) {
 // INDIRECT_BUFFERs into the device's static block: setup, SQ_GPR_MANAGEMENT, 24 invisible points).
 REX_EXTERN(__imp__sub_826C04A0);
 REX_HOOK_RAW(sub_826C04A0) {
+  if (crackdown::SingleTileSuppressed()) return;
   crackdown::CaptureDraw(ctx, base, false, [&] { __imp__sub_826C04A0(ctx, base); }, crackdown::Source::kClear);
 }
 
 REX_EXTERN(__imp__sub_826BE578);
 REX_HOOK_RAW(sub_826BE578) {
+  if (crackdown::SingleTileSuppressed()) return;
   crackdown::CaptureDraw(ctx, base, false, [&] { __imp__sub_826BE578(ctx, base); }, crackdown::Source::kResolve);
 }
 
@@ -615,6 +626,7 @@ REX_HOOK_RAW(sub_826C3750) {
   const uint32_t segment_end = crackdown::guest::Load32(base, device + crackdown::kSegmentEnd);
   if (!crackdown::g_recording.load(std::memory_order_relaxed)) {
     __imp__sub_826C3750(ctx, base);
+    crackdown::SingleTileCommandBuffer(base, device, pre, segment_end);
     return;
   }
   const uint32_t command_buffer = ctx.r4.u32;
@@ -623,6 +635,7 @@ REX_HOOK_RAW(sub_826C3750) {
     if (crackdown::g_capture.file) crackdown::WalkGap(base, device, pre, segment_end);
   }
   __imp__sub_826C3750(ctx, base);
+  crackdown::SingleTileCommandBuffer(base, device, pre, segment_end);
   std::lock_guard lock(crackdown::g_capture.mutex);
   if (crackdown::g_capture.file) {
     crackdown::g_source = crackdown::Source::kCommandBuffer;
